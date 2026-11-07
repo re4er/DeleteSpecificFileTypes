@@ -11,8 +11,10 @@ PURPOSE
   subfolders and deletes exactly the file types you no longer need.
 
 MODES (main menu)
-  1  Scan            Lists every file type (extension) with number of files
-                     and total size, sorted by number of files.
+  1  Scan            Lists every file type with number of files and total
+                     size, sorted by number of files. The file type is the
+                     extension, for files without one their name, see
+                     FILES WITHOUT EXTENSION.
   2  Delete          Deletes all files of the file types you type in, for
                      example ".chk .tmp". Without a scan there is no list
                      and no preselection, see SELECTING FILE TYPES.
@@ -133,6 +135,9 @@ SAFETY
     external hard disks, not USB sticks or network drives). If Windows cannot
     recycle a single file, for example because it is larger than the recycle
     bin, a Windows dialog asks before that file is deleted permanently.
+  * Only the marked items go to the recycle bin. On its own Windows would also
+    move the folder of a saved web page, for example "Page-Dateien" or
+    "Page_files", together with "Page.htm", and the other way round.
 
 REQUIREMENTS
   * Windows 10 or 11
@@ -150,7 +155,8 @@ USAGE
   A folder given at start that does not exist or is not allowed is refused
   with a message and the program does not start. In the program the folder
   is asked for every run: Enter keeps the last one, or type, paste or drag
-  another one into the console window.
+  another one into the console window. The folder is taken as typed,
+  environment variables such as %TEMP% are not replaced.
   Questions show the possible answers in parentheses, for example (y/n), and
   the default in brackets, for example [n]. Enter takes the default.
   While the selection window is open the console waits, closing the window
@@ -280,9 +286,12 @@ FOF_SILENT = 0x0004                     # no progress dialog
 FOF_NOCONFIRMATION = 0x0010             # no "are you sure" questions
 FOF_ALLOWUNDO = 0x0040                  # use the recycle bin
 FOF_NOERRORUI = 0x0400                  # no error dialogs
+# Only the given paths. Without it Windows also recycles the folder of a saved web page with its file,
+# for example "Page-Dateien" or "Page_files" with "Page.htm", and the file with an empty such folder.
+FOF_NO_CONNECTED_ELEMENTS = 0x2000
 FOF_WANTNUKEWARNING = 0x4000            # ask before a file is deleted permanently instead of recycled
 RECYCLE_BIN_FLAGS = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT
-                     | FOF_NOERRORUI | FOF_WANTNUKEWARNING)
+                     | FOF_NOERRORUI | FOF_NO_CONNECTED_ELEMENTS | FOF_WANTNUKEWARNING)
 SHELL_MAX_PATH_LENGTH = 259             # MAX_PATH without the terminating null character
 VOLUME_PATH_BUFFER_LENGTH = 32768
 DRIVE_FIXED = 3                         # GetDriveTypeW: internal or external hard disk
@@ -440,7 +449,7 @@ class FileRecord(NamedTuple):
     """A file found by the folder walk."""
 
     path: str               # extended length path, used for all file operations
-    extension: str          # file type: lower case extension with dot, see get_file_type for files without one
+    file_type: str          # lower case extension with dot, see get_file_type for files without one
     size_bytes: int
 
 
@@ -529,7 +538,7 @@ class DeletionPlan:
 
     root_folder: str
     include_system_files: bool
-    extensions: Set[str]
+    file_types: Set[str]
     method: DeletionMethod
     empty_folder_policy: EmptyFolderPolicy
     expected_file_total: Optional[int] = None      # known when a scan ran before
@@ -630,43 +639,43 @@ class RecycleBin:
         self._shell_file_operation.argtypes = [ctypes.POINTER(ShellFileOperation)]
         self._shell_file_operation.restype = ctypes.c_int
 
-    def move_files(self, file_paths: List[str]) -> Dict[str, Optional[str]]:
-        """Recycle files and return an error message per path, None means success."""
+    def move_items(self, item_paths: List[str]) -> Dict[str, Optional[str]]:
+        """Recycle files and empty folders and return an error message per path, None means success."""
         outcomes: Dict[str, Optional[str]] = {}
         shell_paths: Dict[str, str] = {}
-        for file_path in file_paths:
-            display_path = to_display_path(file_path)
+        for item_path in item_paths:
+            display_path = to_display_path(item_path)
             if is_path_usable_by_shell(display_path):
-                shell_paths[file_path] = display_path
+                shell_paths[item_path] = display_path
             else:
-                outcomes[file_path] = ("the recycle bin cannot handle this path (too long or special name), "
+                outcomes[item_path] = ("the recycle bin cannot handle this path (too long or special name), "
                                        "use permanent deletion")
         if shell_paths:
             outcomes.update(self._recycle_and_verify(shell_paths))
         return outcomes
 
     def _recycle_and_verify(self, shell_paths: Dict[str, str]) -> Dict[str, Optional[str]]:
-        """Recycle a group of files and check which of them are really gone."""
+        """Recycle a group of files or empty folders and check which of them are really gone."""
         return_code, operations_aborted = self._run_shell_operation(list(shell_paths.values()))
         outcomes: Dict[str, Optional[str]] = {}
         remaining_paths: Dict[str, str] = {}
-        for file_path, display_path in shell_paths.items():
-            if os.path.lexists(file_path):
-                remaining_paths[file_path] = display_path
+        for item_path, display_path in shell_paths.items():
+            if os.path.lexists(item_path):
+                remaining_paths[item_path] = display_path
             else:
-                outcomes[file_path] = None
+                outcomes[item_path] = None
         if not remaining_paths:
             return outcomes
 
         was_cancelled = return_code in SHELL_CANCEL_CODES or (operations_aborted and return_code == 0)
         if len(shell_paths) == 1 or was_cancelled:
             error_message = describe_shell_result(return_code, was_cancelled)
-            outcomes.update((file_path, error_message) for file_path in remaining_paths)
+            outcomes.update((item_path, error_message) for item_path in remaining_paths)
             return outcomes
 
         # The shell stops a group at the first problem, so the rest is retried one by one
-        for file_path, display_path in remaining_paths.items():
-            outcomes.update(self._recycle_and_verify({file_path: display_path}))
+        for item_path, display_path in remaining_paths.items():
+            outcomes.update(self._recycle_and_verify({item_path: display_path}))
         return outcomes
 
     def _run_shell_operation(self, display_paths: List[str]) -> Tuple[int, bool]:
@@ -869,7 +878,7 @@ class FileTypeScanner:
                     break
                 reporter.current_folder = to_display_path(folder_content.path)
                 for file_record in folder_content.files:
-                    add_to_type_statistics(self._statistics_by_type, file_record.extension, file_record.size_bytes)
+                    add_to_type_statistics(self._statistics_by_type, file_record.file_type, file_record.size_bytes)
                     self._file_count += 1
                     self._total_bytes += file_record.size_bytes
                 reporter.tick()
@@ -906,9 +915,9 @@ if not PYSIDE_IMPORT_ERROR:
 
         def __init__(self, sorted_types: List[Tuple[str, TypeStatistics]], parent: QtCore.QObject) -> None:
             super().__init__(parent)
-            self.ticked_extensions: Set[str] = set()
-            self._statistics_by_extension = dict(sorted_types)
-            self._search_texts = {extension: format_extension(extension).lower() for extension, _ in sorted_types}
+            self.ticked_file_types: Set[str] = set()
+            self._statistics_by_file_type = dict(sorted_types)
+            self._search_texts = {file_type: format_file_type(file_type).lower() for file_type, _ in sorted_types}
             self._all_types = list(sorted_types)
             self._shown_types = list(sorted_types)
             self._filter_text = ""
@@ -950,13 +959,13 @@ if not PYSIDE_IMPORT_ERROR:
                 return QtCore.Qt.ItemFlag.NoItemFlags
             return self._column_flags[index.column()]
 
-        def extension_at(self, row: int) -> str:
+        def file_type_at(self, row: int) -> str:
             """File type of a shown row."""
             return self._shown_types[row][0]
 
-        def shown_extensions(self) -> List[str]:
+        def shown_file_types(self) -> List[str]:
             """File types the filter shows, in their current order."""
-            return [extension for extension, _ in self._shown_types]
+            return [file_type for file_type, _ in self._shown_types]
 
         @property
         def shown_count(self) -> int:
@@ -975,12 +984,12 @@ if not PYSIDE_IMPORT_ERROR:
             # The height is asked for often, a ready answer keeps long lists fast
             if role == QtCore.Qt.ItemDataRole.SizeHintRole:
                 return self._row_size_hint
-            extension, statistics = self._shown_types[index.row()]
-            is_ticked = extension in self.ticked_extensions
+            file_type, statistics = self._shown_types[index.row()]
+            is_ticked = file_type in self.ticked_file_types
             column = index.column()
             if role == QtCore.Qt.ItemDataRole.DisplayRole:
                 if column == COLUMN_TYPE:
-                    return to_window_text(format_extension(extension))
+                    return to_window_text(format_file_type(file_type))
                 return format_count(statistics.file_count)
             if role == QtCore.Qt.ItemDataRole.CheckStateRole and column == COLUMN_TYPE:
                 return QtCore.Qt.CheckState.Checked if is_ticked else QtCore.Qt.CheckState.Unchecked
@@ -993,7 +1002,7 @@ if not PYSIDE_IMPORT_ERROR:
             if role == QtCore.Qt.ItemDataRole.BackgroundRole and is_ticked:
                 return self._delete_background
             if role == QtCore.Qt.ItemDataRole.ToolTipRole:
-                return (f"{to_window_text(format_extension(extension))}: "
+                return (f"{to_window_text(format_file_type(file_type))}: "
                         f"{format_quantity(statistics.file_count, 'file')}, {format_size(statistics.total_bytes)}")
             return None
 
@@ -1002,17 +1011,17 @@ if not PYSIDE_IMPORT_ERROR:
             if not index.isValid() or index.column() != COLUMN_TYPE or role != QtCore.Qt.ItemDataRole.CheckStateRole:
                 return False
             is_ticked = QtCore.Qt.CheckState(value) == QtCore.Qt.CheckState.Checked
-            self.set_ticks([self.extension_at(index.row())], is_ticked)
+            self.set_ticks([self.file_type_at(index.row())], is_ticked)
             return True
 
         # ==== Ticks ===========================================================
 
-        def set_ticks(self, extensions: Iterable[str], is_ticked: bool) -> None:
+        def set_ticks(self, file_types: Iterable[str], is_ticked: bool) -> None:
             """Tick or untick file types. The view redraws only the rows on the screen."""
             if is_ticked:
-                self.ticked_extensions.update(extensions)
+                self.ticked_file_types.update(file_types)
             else:
-                self.ticked_extensions.difference_update(extensions)
+                self.ticked_file_types.difference_update(file_types)
             if self._shown_types:
                 # Naming the changed roles tells the view that no row changes its height
                 self.dataChanged.emit(self.index(0, 0),
@@ -1022,7 +1031,7 @@ if not PYSIDE_IMPORT_ERROR:
 
         def ticked_totals(self) -> Tuple[int, int, int]:
             """Ticked file types, their files and bytes, also those the filter hides."""
-            ticked_statistics = [self._statistics_by_extension[extension] for extension in self.ticked_extensions]
+            ticked_statistics = [self._statistics_by_file_type[file_type] for file_type in self.ticked_file_types]
             return (len(ticked_statistics), sum(statistics.file_count for statistics in ticked_statistics),
                     sum(statistics.total_bytes for statistics in ticked_statistics))
 
@@ -1111,7 +1120,7 @@ if not PYSIDE_IMPORT_ERROR:
             finally:
                 interrupt_timer.stop()
                 signal.signal(signal.SIGINT, previous_handler)
-            return set(self._model.ticked_extensions) if self._was_confirmed else None
+            return set(self._model.ticked_file_types) if self._was_confirmed else None
 
         def _cancel(self) -> None:
             """Close the window without handing over the ticks."""
@@ -1254,15 +1263,15 @@ if not PYSIDE_IMPORT_ERROR:
 
         def _tick_shown_types(self, is_ticked: bool) -> None:
             """Tick or untick every file type the filter shows."""
-            self._model.set_ticks(self._model.shown_extensions(), is_ticked)
+            self._model.set_ticks(self._model.shown_file_types(), is_ticked)
 
         def _toggle_selected_rows(self) -> None:
             """Tick all selected file types, or untick them if all of them are ticked."""
-            extensions = [self._model.extension_at(index.row())
+            file_types = [self._model.file_type_at(index.row())
                           for index in self._tree.selectionModel().selectedRows(COLUMN_TYPE)]
-            if extensions:
-                is_ticked = any(extension not in self._model.ticked_extensions for extension in extensions)
-                self._model.set_ticks(extensions, is_ticked)
+            if file_types:
+                is_ticked = any(file_type not in self._model.ticked_file_types for file_type in file_types)
+                self._model.set_ticks(file_types, is_ticked)
 
         def _update_type_count(self) -> None:
             """Show how many file types the filter shows."""
@@ -1343,7 +1352,7 @@ class FileDeleter:
                 if self._interrupt_guard.was_requested:
                     break
                 self.result.files_checked += 1
-                selected_type = self._selected_type(file_record.extension)
+                selected_type = self._selected_type(file_record.file_type)
                 if selected_type is not None:
                     self._queue_file(file_record, folder_state, selected_type)
             if self._interrupt_guard.was_requested:
@@ -1358,9 +1367,9 @@ class FileDeleter:
 
         Without scan a single "." chooses all files without extension, whatever their name.
         """
-        if file_type in self.plan.extensions:
+        if file_type in self.plan.file_types:
             return file_type
-        if is_no_extension_type(file_type) and ALL_NO_EXTENSION_TYPE in self.plan.extensions:
+        if is_no_extension_type(file_type) and ALL_NO_EXTENSION_TYPE in self.plan.file_types:
             return ALL_NO_EXTENSION_TYPE
         return None
 
@@ -1409,7 +1418,7 @@ class FileDeleter:
         elif self.plan.method is DeletionMethod.PERMANENT:
             outcomes.update((file_path, remove_path(file_path, os.remove)) for file_path in deletable_paths)
         elif deletable_paths and self._recycle_bin is not None:
-            outcomes.update(self._recycle_bin.move_files(deletable_paths))
+            outcomes.update(self._recycle_bin.move_items(deletable_paths))
         return outcomes
 
     # ==== Empty folders =======================================================
@@ -1456,7 +1465,7 @@ class FileDeleter:
         folder_change = describe_folder_change(folder_path)
         if folder_change is not None:
             return folder_change
-        return self._recycle_bin.move_files([folder_path]).get(folder_path, "no result from the recycle bin")
+        return self._recycle_bin.move_items([folder_path]).get(folder_path, "no result from the recycle bin")
 
     # ==== Output ==============================================================
 
@@ -1489,10 +1498,10 @@ class ReportBuilder:
         """Summary of the deletion plan, shown before the confirmation."""
         lines = section_lines("DELETION PLAN")
         lines.append(f"  Target folder  : {plan.root_folder}")
-        lines.append(f"  File types     : {join_extensions(plan.extensions)}")
+        lines.append(f"  File types     : {join_file_types(plan.file_types)}")
         if scan_result is not None:
-            selected_statistics = [scan_result.statistics_by_type[extension] for extension in plan.extensions
-                                   if extension in scan_result.statistics_by_type]
+            selected_statistics = [scan_result.statistics_by_type[file_type] for file_type in plan.file_types
+                                   if file_type in scan_result.statistics_by_type]
             file_count = sum(statistics.file_count for statistics in selected_statistics)
             total_bytes = sum(statistics.total_bytes for statistics in selected_statistics)
             lines.append(f"  Matching files : {format_count(file_count)} files, "
@@ -1539,7 +1548,7 @@ class ReportBuilder:
             title += "   (cancelled, incomplete)"
         lines = section_lines(title)
         lines.append(f"  Target folder : {plan.root_folder}")
-        lines.append(f"  File types    : {join_extensions(plan.extensions)}")
+        lines.append(f"  File types    : {join_file_types(plan.file_types)}")
         lines.append(f"  System files  : {'included' if plan.include_system_files else 'excluded'}")
         lines.append(f"  Method        : {plan.method.value}")
         lines.append(f"  Files checked : {format_count(result.files_checked)}")
@@ -1586,7 +1595,7 @@ class ReportBuilder:
     def _scan_table(sorted_types: List[Tuple[str, TypeStatistics]], type_column_width: int) -> List[str]:
         """Numbered table of the file types with files and size, closed by a total line."""
         number_width = max(3, len(str(len(sorted_types))))
-        longest_label = max(len(format_extension(extension)) for extension, _ in sorted_types)
+        longest_label = max(len(format_file_type(file_type)) for file_type, _ in sorted_types)
         type_width = max(len("File type"), min(type_column_width, longest_label))
 
         def table_row(number_text: str, type_text: str, count_text: str, size_text: str) -> str:
@@ -1594,8 +1603,8 @@ class ReportBuilder:
 
         separator = table_row("-" * number_width, "-" * type_width, "-" * 13, "-" * 11)
         lines = [table_row("No.", "File type", "Files", "Size"), separator]
-        for number, (extension, statistics) in enumerate(sorted_types, start=1):
-            lines.append(table_row(str(number), shorten_text(format_extension(extension), type_width),
+        for number, (file_type, statistics) in enumerate(sorted_types, start=1):
+            lines.append(table_row(str(number), shorten_text(format_file_type(file_type), type_width),
                                    format_count(statistics.file_count), format_size(statistics.total_bytes)))
         lines.append(separator)
         total_files = sum(statistics.file_count for _, statistics in sorted_types)
@@ -1607,9 +1616,9 @@ class ReportBuilder:
     def _deletion_table(result: DeletionResult, is_simulation: bool, type_column_width: int) -> List[str]:
         """Deleted and failed files per chosen file type, closed by a total line."""
         empty_statistics = TypeStatistics()
-        extensions = sorted(result.plan.extensions, key=lambda extension: (
-            -result.deleted_by_type.get(extension, empty_statistics).file_count, extension))
-        longest_label = max(len(format_extension(extension)) for extension in extensions)
+        file_types = sorted(result.plan.file_types, key=lambda file_type: (
+            -result.deleted_by_type.get(file_type, empty_statistics).file_count, file_type))
+        longest_label = max(len(format_file_type(file_type)) for file_type in file_types)
         type_width = max(len("File type"), min(type_column_width, longest_label))
 
         def table_row(type_text: str, deleted_text: str, size_text: str, failed_text: str) -> str:
@@ -1618,10 +1627,10 @@ class ReportBuilder:
         separator = table_row("-" * type_width, "-" * 13, "-" * 11, "-" * 10)
         lines = [table_row("File type", "Would delete" if is_simulation else "Deleted", "Size", "Failed"),
                  separator]
-        for extension in extensions:
-            deleted = result.deleted_by_type.get(extension, empty_statistics)
-            failed = result.failed_by_type.get(extension, empty_statistics)
-            lines.append(table_row(shorten_text(format_extension(extension), type_width),
+        for file_type in file_types:
+            deleted = result.deleted_by_type.get(file_type, empty_statistics)
+            failed = result.failed_by_type.get(file_type, empty_statistics)
+            lines.append(table_row(shorten_text(format_file_type(file_type), type_width),
                                    format_count(deleted.file_count), format_size(deleted.total_bytes),
                                    format_count(failed.file_count)))
         lines.append(separator)
@@ -1758,10 +1767,10 @@ class ConsoleDialog:
             answer = input("File types: ").strip()
             if not answer:
                 return set()
-            extensions, error_messages = parse_typed_extensions(answer)
+            file_types, error_messages = parse_typed_file_types(answer)
             if not error_messages:
-                print(f"  Selected file types ({len(extensions)}): {join_extensions(extensions)}")
-                return extensions
+                print(f"  Selected file types ({len(file_types)}): {join_file_types(file_types)}")
+                return file_types
             for error_message in error_messages:
                 print(f"  {error_message}")
 
@@ -1775,15 +1784,15 @@ class ConsoleDialog:
         print(f'  Files without extension are listed by name, a single "{NO_EXTENSION_INPUT}" chooses all of them.')
         print("  All forms can be combined. File types made of digits need the dot: .001")
         print("  Press Enter without input to skip the deletion.")
-        numbered_extensions = [extension for extension, _ in sorted_types]
+        numbered_file_types = [file_type for file_type, _ in sorted_types]
         while True:
             answer = input("Selection: ").strip()
             if not answer:
                 return set()
-            extensions, error_messages = parse_scan_selection(answer, numbered_extensions)
+            file_types, error_messages = parse_scan_selection(answer, numbered_file_types)
             if not error_messages:
-                self.show_scan_selection(extensions, len(numbered_extensions))
-                return extensions
+                self.show_scan_selection(file_types, len(numbered_file_types))
+                return file_types
             for error_message in error_messages:
                 print(f"  {error_message}")
 
@@ -1797,10 +1806,10 @@ class ConsoleDialog:
         print("The selection window lists all file types with a checkbox, handy for long lists.")
         return self._ask_yes_no("Choose the file types in the selection window?", default=True)
 
-    def show_scan_selection(self, extensions: Set[str], scan_type_count: int) -> None:
+    def show_scan_selection(self, file_types: Set[str], scan_type_count: int) -> None:
         """Repeat the file types chosen after a scan, with a warning if these are all of them."""
-        print(f"  Selected file types ({len(extensions)}): {join_extensions(extensions)}")
-        if len(extensions) == scan_type_count:
+        print(f"  Selected file types ({len(file_types)}): {join_file_types(file_types)}")
+        if len(file_types) == scan_type_count:
             print("  These are all file types of the scan, every file found will be deleted.")
 
     def ask_deletion_method(self, volume: TargetVolume) -> DeletionMethod:
@@ -1926,7 +1935,7 @@ class FileTypeCleanerApp:
 
         scan_result: Optional[ScanResult] = None
         if mode is RunMode.DELETE:
-            extensions = self._dialog.ask_types_to_delete()
+            file_types = self._dialog.ask_types_to_delete()
         else:
             scan_result = self._run_scan(root_folder, include_system_files, volume, save_reports)
             if mode is RunMode.SCAN:
@@ -1937,15 +1946,15 @@ class FileTypeCleanerApp:
             if not scan_result.statistics_by_type:
                 print("\nNo files found, nothing to delete.")
                 return
-            extensions = self._choose_types_from_scan(scan_result)
-        if not extensions:
+            file_types = self._choose_types_from_scan(scan_result)
+        if not file_types:
             print("\nNo file types selected, nothing was deleted.")
             return
 
         plan = DeletionPlan(
             root_folder=root_folder,
             include_system_files=include_system_files,
-            extensions=extensions,
+            file_types=file_types,
             method=self._dialog.ask_deletion_method(volume),
             empty_folder_policy=self._dialog.ask_empty_folder_policy(),
             expected_file_total=scan_result.total_files if scan_result is not None else None,
@@ -1983,16 +1992,16 @@ class FileTypeCleanerApp:
         print(f"[{clock_time()}] The selection window is open. If you do not see it, look in the taskbar.")
         print('           Close it or press "Continue with the ticked file types" to come back here.')
         try:
-            extensions = FileTypeSelectionWindow.show_and_wait(scan_result)
+            file_types = FileTypeSelectionWindow.show_and_wait(scan_result)
         except Exception:
             traceback.print_exc()
             print("The selection window failed, see above. Choose the file types here instead.")
             return self._dialog.ask_types_from_scan(scan_result.sorted_types())
-        if extensions is None:
+        if file_types is None:
             print("The selection window was closed without continuing.")
             return set()
-        self._dialog.show_scan_selection(extensions, len(scan_result.statistics_by_type))
-        return extensions
+        self._dialog.show_scan_selection(file_types, len(scan_result.statistics_by_type))
+        return file_types
 
     def _run_deletion(self, plan: DeletionPlan, volume: TargetVolume,
                       plan_lines: List[str], save_reports: bool) -> None:
@@ -2101,7 +2110,8 @@ def resolve_target_folder(raw_input: str) -> Tuple[Optional[str], str]:
     cleaned_input = raw_input.strip().strip('"').strip("'").strip()
     if not cleaned_input:
         return None, "No folder entered."
-    expanded_input = os.path.expandvars(os.path.expanduser(cleaned_input))
+    # Environment variables are not replaced, so a folder named $Temp or %Temp% keeps its name
+    expanded_input = os.path.expanduser(cleaned_input)
     if re.fullmatch(r"[A-Za-z]:", expanded_input):
         expanded_input += "\\"
     absolute_path = os.path.abspath(expanded_input)
@@ -2147,7 +2157,7 @@ def is_path_usable_by_shell(display_path: str) -> bool:
 
 
 def get_file_type(file_name: str) -> str:
-    """Lower case extension including the dot, for example .jpg.
+    """File type of a file name: its lower case extension including the dot, for example .jpg.
 
     A file without extension, for example .gitignore or README, forms a file type of its own:
     NO_EXTENSION_TYPE_PREFIX followed by its lower case name.
@@ -2231,7 +2241,7 @@ def describe_os_error(error: OSError) -> str:
 
 
 def describe_shell_result(return_code: int, was_cancelled: bool) -> str:
-    """Readable reason why the Windows shell did not recycle a file."""
+    """Readable reason why the Windows shell did not recycle a file or folder."""
     if was_cancelled:
         return "cancelled in the Windows dialog"
     if return_code == 0:
@@ -2287,8 +2297,8 @@ def is_number_or_range(token: str) -> bool:
     return re.fullmatch(r"[\d-]+", token) is not None
 
 
-def parse_extension_token(token: str) -> Tuple[Optional[str], str]:
-    """Turn a typed file type like "tmp", ".TMP" or "*.tmp" into ".tmp". Return (extension, error).
+def parse_file_type_token(token: str) -> Tuple[Optional[str], str]:
+    """Turn a typed file type like "tmp", ".TMP" or "*.tmp" into ".tmp". Return (file type, error).
 
     A single "." stands for all files without extension.
     """
@@ -2307,10 +2317,10 @@ def parse_extension_token(token: str) -> Tuple[Optional[str], str]:
     return extension.lower(), ""
 
 
-def parse_typed_extensions(text: str) -> Tuple[Set[str], List[str]]:
-    """Parse file types typed for a deletion without scan. Return (extensions, error messages)."""
+def parse_typed_file_types(text: str) -> Tuple[Set[str], List[str]]:
+    """Parse file types typed for a deletion without scan. Return (file types, error messages)."""
     parts, error_messages = split_selection(text)
-    extensions: Set[str] = set()
+    file_types: Set[str] = set()
     for part in parts:
         if is_number_or_range(part.token):
             error_messages.append(f'"{part.token}": numbers and ranges need the list of a scan, use mode 3 '
@@ -2319,56 +2329,57 @@ def parse_typed_extensions(text: str) -> Tuple[Set[str], List[str]]:
             error_messages.append(f'"{part.token} ({" ".join(part.exclusion_tokens)})": exclusions in brackets '
                                   f'need the list of a scan, use mode 3 (Scan + delete).')
         else:
-            extension, error_message = parse_extension_token(part.token)
-            if extension is None:
+            file_type, error_message = parse_file_type_token(part.token)
+            if file_type is None:
                 error_messages.append(error_message)
             else:
-                extensions.add(extension)
+                file_types.add(file_type)
     if not parts and not error_messages:
         error_messages.append("No file type entered. Press Enter without input to cancel.")
-    return extensions, error_messages
+    return file_types, error_messages
 
 
-def parse_scan_selection(text: str, numbered_extensions: List[str]) -> Tuple[Set[str], List[str]]:
+def parse_scan_selection(text: str, numbered_file_types: List[str]) -> Tuple[Set[str], List[str]]:
     """Parse numbers, ranges with exclusions and file types chosen from the scan table.
 
-    Return (extensions, error messages).
+    Return (file types, error messages).
     """
     parts, error_messages = split_selection(text)
-    number_by_extension = {extension: number for number, extension in enumerate(numbered_extensions, start=1)}
+    number_by_file_type = {file_type: number for number, file_type in enumerate(numbered_file_types, start=1)}
     selected_numbers: Set[int] = set()
     for part in parts:
-        numbers, error_message = resolve_scan_token(part.token, number_by_extension)
+        numbers, error_message = resolve_scan_token(part.token, number_by_file_type)
         if numbers is None:
             error_messages.append(error_message)
             continue
         if part.exclusion_tokens is not None:
-            numbers = remove_exclusions(part, numbers, number_by_extension, error_messages)
+            numbers = remove_exclusions(part, numbers, number_by_file_type, error_messages)
         selected_numbers.update(numbers)
     if not parts and not error_messages:
         error_messages.append("No file type selected. Press Enter without input to skip the deletion.")
-    return {numbered_extensions[number - 1] for number in selected_numbers}, error_messages
+    return {numbered_file_types[number - 1] for number in selected_numbers}, error_messages
 
 
-def resolve_scan_token(token: str, number_by_extension: Dict[str, int]) -> Tuple[Optional[Set[int]], str]:
+def resolve_scan_token(token: str, number_by_file_type: Dict[str, int]) -> Tuple[Optional[Set[int]], str]:
     """Turn a number, a range or a file type into numbers of the scan table. Return (numbers, error)."""
     if not is_number_or_range(token):
-        extension, error_message = parse_extension_token(token)
-        if extension is None:
+        file_type, error_message = parse_file_type_token(token)
+        if file_type is None:
             return None, error_message
-        if extension == ALL_NO_EXTENSION_TYPE:
-            numbers = {number for file_type, number in number_by_extension.items() if is_no_extension_type(file_type)}
+        if file_type == ALL_NO_EXTENSION_TYPE:
+            numbers = {number for listed_type, number in number_by_file_type.items()
+                       if is_no_extension_type(listed_type)}
             if not numbers:
                 return None, f'"{token}": the scan found no files without extension.'
             return numbers, ""
-        if extension not in number_by_extension:
-            error_message = f'"{token}": the file type {format_extension(extension)} was not found by the scan.'
+        if file_type not in number_by_file_type:
+            error_message = f'"{token}": the file type {format_file_type(file_type)} was not found by the scan.'
             # A typed name like .gitignore or README may mean the file without extension of that name
-            no_extension_number = number_by_extension.get(NO_EXTENSION_TYPE_PREFIX + token.lower())
+            no_extension_number = number_by_file_type.get(NO_EXTENSION_TYPE_PREFIX + token.lower())
             if no_extension_number is not None:
                 error_message += f' The file without extension "{token}" has the number {no_extension_number}.'
             return None, error_message
-        return {number_by_extension[extension]}, ""
+        return {number_by_file_type[file_type]}, ""
 
     number_match = re.fullmatch(r"(\d+)(?:-(\d+))?", token)
     if number_match is None:
@@ -2380,14 +2391,14 @@ def resolve_scan_token(token: str, number_by_extension: Dict[str, int]) -> Tuple
     first_number = int(number_match.group(1))
     last_number = int(number_match.group(2) or first_number)
     first_number, last_number = min(first_number, last_number), max(first_number, last_number)
-    row_count = len(number_by_extension)
+    row_count = len(number_by_file_type)
     if first_number < 1 or last_number > row_count:
         available_numbers = "only the number 1" if row_count == 1 else f"the numbers 1 to {row_count}"
         return None, f'"{token}": the list has {available_numbers}.'
     return set(range(first_number, last_number + 1)), ""
 
 
-def remove_exclusions(part: SelectionPart, numbers: Set[int], number_by_extension: Dict[str, int],
+def remove_exclusions(part: SelectionPart, numbers: Set[int], number_by_file_type: Dict[str, int],
                       error_messages: List[str]) -> Set[int]:
     """Remove the numbers and file types in brackets from a range. Problems are added to error_messages."""
     if not re.fullmatch(r"\d+-\d+", part.token):
@@ -2396,7 +2407,7 @@ def remove_exclusions(part: SelectionPart, numbers: Set[int], number_by_extensio
         return set()
     excluded_numbers: Set[int] = set()
     for exclusion_token in part.exclusion_tokens or []:
-        exclusion_numbers, error_message = resolve_scan_token(exclusion_token, number_by_extension)
+        exclusion_numbers, error_message = resolve_scan_token(exclusion_token, number_by_file_type)
         if exclusion_numbers is None:
             error_messages.append(error_message)
         elif exclusion_token == NO_EXTENSION_INPUT:
@@ -2450,23 +2461,23 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{remaining_seconds:02d}"
 
 
-def format_extension(extension: str) -> str:
+def format_file_type(file_type: str) -> str:
     """Display text of a file type, files without extension show their name.
 
     Odd ones are quoted, so spaces and control characters are visible.
     """
-    if extension == ALL_NO_EXTENSION_TYPE:
+    if file_type == ALL_NO_EXTENSION_TYPE:
         return ALL_NO_EXTENSION_LABEL
-    is_name = is_no_extension_type(extension)
-    text = extension[len(NO_EXTENSION_TYPE_PREFIX):] if is_name else extension
+    is_name = is_no_extension_type(file_type)
+    text = file_type[len(NO_EXTENSION_TYPE_PREFIX):] if is_name else file_type
     if text != text.strip() or not text.isprintable():
         text = repr(text)
     return f"{NO_EXTENSION_LABEL}: {text}" if is_name else text
 
 
-def join_extensions(extensions: Set[str]) -> str:
+def join_file_types(file_types: Set[str]) -> str:
     """Sorted file types as one line separated by commas."""
-    return ", ".join(format_extension(extension) for extension in sorted(extensions))
+    return ", ".join(format_file_type(file_type) for file_type in sorted(file_types))
 
 
 def to_window_text(text: str) -> str:
